@@ -1,302 +1,528 @@
 "use client";
 
-/**
- * ApnaDost — File Storage (/files)
- * Design: Heavy Glassmorphism, dual light/dark theme, CSS-variable driven.
- */
-
-import {
-  CATEGORY_META,
-  FileCategory,
-  FileEntry,
-  StorageStats,
-  fileApi,
-  getFileIcon,
-} from "@/lib/fileApi";
 import { format, parseISO } from "date-fns";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import Cookies from "js-cookie";
 import Link from "next/link";
 
-// ─── Scoped CSS ───────────────────────────────────────────────────────────────
-const FL_CSS = `
+type FileCategory =
+  | "DOCUMENT"
+  | "IMAGE"
+  | "VIDEO"
+  | "AUDIO"
+  | "SPREADSHEET"
+  | "PRESENTATION"
+  | "OTHER";
+
+interface FileEntry {
+  id: number;
+  originalFileName: string;
+  fileType: string;
+  fileSize: number;
+  fileSizeFormatted: string;
+  description?: string;
+  category: FileCategory;
+  uploadedAt: string;
+  usedForChat?: boolean;
+}
+
+interface StorageStats {
+  totalFiles: number;
+  totalSizeBytes: number;
+  totalFormatted: string;
+  filesByCategory?: Record<string, number>;
+}
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const CAT: Record<
+  FileCategory,
+  { label: string; emoji: string; color: string; bg: string; border: string }
+> = {
+  DOCUMENT: {
+    label: "Docs",
+    emoji: "📄",
+    color: "#f59e0b",
+    bg: "rgba(245,158,11,0.12)",
+    border: "rgba(245,158,11,0.30)",
+  },
+  IMAGE: {
+    label: "Images",
+    emoji: "🖼️",
+    color: "#60a5fa",
+    bg: "rgba(96,165,250,0.12)",
+    border: "rgba(96,165,250,0.30)",
+  },
+  VIDEO: {
+    label: "Videos",
+    emoji: "🎬",
+    color: "#a78bfa",
+    bg: "rgba(167,139,250,0.12)",
+    border: "rgba(167,139,250,0.30)",
+  },
+  AUDIO: {
+    label: "Audio",
+    emoji: "🎵",
+    color: "#34d399",
+    bg: "rgba(52,211,153,0.12)",
+    border: "rgba(52,211,153,0.30)",
+  },
+  SPREADSHEET: {
+    label: "Sheets",
+    emoji: "📊",
+    color: "#4ade80",
+    bg: "rgba(74,222,128,0.12)",
+    border: "rgba(74,222,128,0.30)",
+  },
+  PRESENTATION: {
+    label: "Slides",
+    emoji: "📑",
+    color: "#f97316",
+    bg: "rgba(249,115,22,0.12)",
+    border: "rgba(249,115,22,0.30)",
+  },
+  OTHER: {
+    label: "Other",
+    emoji: "📌",
+    color: "#94a3b8",
+    bg: "rgba(148,163,184,0.12)",
+    border: "rgba(148,163,184,0.30)",
+  },
+};
+
+function fileIcon(mime?: string) {
+  if (!mime) return "📄";
+  if (mime.includes("pdf")) return "📕";
+  if (mime.startsWith("image/")) return "🖼️";
+  if (mime.startsWith("video/")) return "🎬";
+  if (mime.startsWith("audio/")) return "🎵";
+  if (
+    mime.includes("spreadsheet") ||
+    mime.includes("excel") ||
+    mime.includes("csv")
+  )
+    return "📊";
+  if (mime.includes("presentation") || mime.includes("powerpoint")) return "📑";
+  if (mime.includes("word") || mime.includes("document")) return "📝";
+  if (mime.includes("zip") || mime.includes("rar")) return "🗜️";
+  return "📄";
+}
+
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+
+function authH(): Record<string, string> {
+  const t = Cookies.get("token");
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { ...authH(), ...(init?.headers ?? {}) },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(
+      (err as { message?: string }).message ?? `Error ${res.status}`,
+    );
+  }
+  return res.json();
+}
+
+const api = {
+  getAll: () => apiFetch<FileEntry[]>("/api/files"),
+  getByCategory: (t: FileCategory) =>
+    apiFetch<FileEntry[]>(`/api/files/category?type=${t}`),
+  getPdfs: () => apiFetch<FileEntry[]>("/api/files/pdfs"),
+  search: (q: string) =>
+    apiFetch<FileEntry[]>(`/api/files/search?q=${encodeURIComponent(q)}`),
+  getStats: () => apiFetch<StorageStats>("/api/files/stats"),
+  delete: (id: number) =>
+    apiFetch<void>(`/api/files/${id}`, { method: "DELETE" }),
+
+  upload: async (file: File, desc?: string): Promise<FileEntry> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (desc) fd.append("description", desc);
+    return apiFetch<FileEntry>("/api/files/upload", {
+      method: "POST",
+      body: fd,
+    });
+  },
+
+  download: async (id: number, name: string) => {
+    const res = await fetch(`${BASE}/api/files/${id}/download`, {
+      headers: authH(),
+    });
+    if (!res.ok) throw new Error("Download failed");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement("a"), {
+      href: url,
+      download: name,
+    });
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
+  prepare: (fileId: number) =>
+    apiFetch<{ wordCount: number; message: string }>(
+      `/api/chat/pdf/${fileId}/prepare`,
+    ),
+
+  chat: async (
+    fileId: number,
+    question: string,
+    history: ChatMessage[],
+  ): Promise<string> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d = await apiFetch<Record<string, any>>("/api/chat/pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileId, question, history }),
+    });
+    const answer =
+      d.answer ??
+      d.response ??
+      d.text ??
+      d.content ??
+      d.message ??
+      d.reply ??
+      d.result;
+    if (!answer) throw new Error("Empty response from server");
+    return String(answer);
+  },
+};
+
+const CSS = `
+  /* tokens */
   :root {
-    --fl-bg-from:       #eef2ff;
-    --fl-bg-to:         #f0f9ff;
-    --fl-glass:         rgba(255,255,255,0.76);
-    --fl-glass-border:  rgba(255,255,255,0.93);
-    --fl-glass-shadow:  0 8px 32px rgba(80,60,180,0.09), 0 1.5px 6px rgba(0,0,0,0.05);
-    --fl-glass-2:       rgba(255,255,255,0.54);
-    --fl-heading:       oklch(0.18 0.02 255);
-    --fl-subtext:       oklch(0.42 0.015 255);
-    --fl-muted:         oklch(0.58 0.010 255);
-    --fl-accent:        #d97706;
-    --fl-input-bg:      rgba(255,255,255,0.65);
-    --fl-input-border:  rgba(200,190,230,0.50);
-    --fl-input-focus:   #d97706;
-    --fl-input-text:    oklch(0.18 0.02 255);
-    --fl-placeholder:   oklch(0.62 0.01 255);
-    --fl-btn-bg:        #d97706;
-    --fl-btn-hover:     #b45309;
-    --fl-btn-text:      #fff;
-    --fl-row-hover:     rgba(255,255,255,0.55);
-    --fl-divider:       rgba(0,0,0,0.07);
-    --fl-drop-border:   rgba(200,190,230,0.40);
-    --fl-drop-hover:    rgba(217,119,6,0.06);
-    --fl-progress-track: rgba(0,0,0,0.07);
+    --bg1:#eef2ff; --bg2:#f0f9ff;
+    --gl:rgba(255,255,255,.78); --glb:rgba(255,255,255,.94);
+    --sh:0 6px 28px rgba(80,60,180,.08),0 1px 5px rgba(0,0,0,.04);
+    --gl2:rgba(255,255,255,.55);
+    --fh:oklch(.18 .02 255); --fs:oklch(.42 .015 255); --fm:oklch(.58 .01 255);
+    --ac:#d97706; --ach:#b45309; --act:#fff;
+    --inb:rgba(255,255,255,.65); --inbd:rgba(200,190,230,.50);
+    --inf:#d97706; --inc:oklch(.18 .02 255); --ph:oklch(.62 .01 255);
+    --rh:rgba(255,255,255,.55); --dv:rgba(0,0,0,.06);
+    --db:rgba(200,190,230,.40); --dh:rgba(217,119,6,.05);
+    --pt:rgba(0,0,0,.07);
   }
   .dark {
-    --fl-bg-from:       #080d1a;
-    --fl-bg-to:         #0b1220;
-    --fl-glass:         rgba(18,26,50,0.72);
-    --fl-glass-border:  rgba(255,255,255,0.08);
-    --fl-glass-shadow:  0 8px 40px rgba(0,0,0,0.50), 0 1.5px 6px rgba(0,0,0,0.30);
-    --fl-glass-2:       rgba(18,26,50,0.55);
-    --fl-heading:       #f0f4ff;
-    --fl-subtext:       #8ba3c7;
-    --fl-muted:         #4d6b8a;
-    --fl-accent:        #f59e0b;
-    --fl-input-bg:      rgba(255,255,255,0.04);
-    --fl-input-border:  rgba(255,255,255,0.10);
-    --fl-input-focus:   #f59e0b;
-    --fl-input-text:    #f0f4ff;
-    --fl-placeholder:   #4d6b8a;
-    --fl-btn-bg:        #f59e0b;
-    --fl-btn-hover:     #d97706;
-    --fl-btn-text:      #0d1120;
-    --fl-row-hover:     rgba(255,255,255,0.04);
-    --fl-divider:       rgba(255,255,255,0.07);
-    --fl-drop-border:   rgba(255,255,255,0.10);
-    --fl-drop-hover:    rgba(245,158,11,0.05);
-    --fl-progress-track: rgba(255,255,255,0.07);
+    --bg1:#080d1a; --bg2:#0b1220;
+    --gl:rgba(18,26,50,.74); --glb:rgba(255,255,255,.08);
+    --sh:0 8px 36px rgba(0,0,0,.48),0 1px 5px rgba(0,0,0,.28);
+    --gl2:rgba(18,26,50,.56);
+    --fh:#f0f4ff; --fs:#8ba3c7; --fm:#4d6b8a;
+    --ac:#f59e0b; --ach:#d97706; --act:#0d1120;
+    --inb:rgba(255,255,255,.04); --inbd:rgba(255,255,255,.10);
+    --inf:#f59e0b; --inc:#f0f4ff; --ph:#4d6b8a;
+    --rh:rgba(255,255,255,.04); --dv:rgba(255,255,255,.07);
+    --db:rgba(255,255,255,.10); --dh:rgba(245,158,11,.05);
+    --pt:rgba(255,255,255,.07);
   }
-  .fl-root {
-    min-height: 100vh;
-    background: linear-gradient(145deg, var(--fl-bg-from) 0%, var(--fl-bg-to) 100%);
-    position: relative; overflow-x: hidden;
+
+  /* page */
+  .pg{min-height:100vh;background:linear-gradient(145deg,var(--bg1) 0%,var(--bg2) 100%);position:relative;overflow-x:hidden;}
+  .blob{position:fixed;border-radius:50%;filter:blur(80px);pointer-events:none;animation:blb 10s ease-in-out infinite alternate;}
+  @keyframes blb{from{transform:translate(0,0) scale(1);}to{transform:translate(24px,-20px) scale(1.04);}}
+  .blob:nth-child(2){animation-delay:-5s;}.blob:nth-child(3){animation-delay:-8s;}
+  .grd{background-image:linear-gradient(rgba(99,102,241,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(99,102,241,.022) 1px,transparent 1px);background-size:36px 36px;}
+
+  /* glass */
+  .panel{background:var(--gl);border:1px solid var(--glb);box-shadow:var(--sh);border-radius:1.25rem;backdrop-filter:blur(24px) saturate(175%);-webkit-backdrop-filter:blur(24px) saturate(175%);}
+  .card{background:var(--gl);border:1px solid var(--glb);box-shadow:var(--sh);border-radius:1.1rem;backdrop-filter:blur(20px) saturate(160%);-webkit-backdrop-filter:blur(20px) saturate(160%);transition:transform .18s,box-shadow .18s;}
+  .card:hover{transform:translateY(-2px);box-shadow:0 12px 36px rgba(0,0,0,.12);}
+  .stat{background:var(--gl);border:1px solid var(--glb);box-shadow:var(--sh);border-radius:1.1rem;backdrop-filter:blur(18px) saturate(155%);-webkit-backdrop-filter:blur(18px) saturate(155%);transition:transform .2s;padding:.875rem .5rem;text-align:center;}
+  .stat:hover{transform:translateY(-2px);}
+
+  /* inputs */
+  .inp{width:100%;background:var(--inb);border:1.5px solid var(--inbd);border-radius:.875rem;color:var(--inc);font-family:var(--font-dm),system-ui,sans-serif;transition:border-color .18s,box-shadow .18s;outline:none;padding:.6rem .85rem;font-size:.875rem;}
+  .inp::placeholder{color:var(--ph);}
+  .inp:focus{border-color:var(--inf);box-shadow:0 0 0 3px color-mix(in srgb,var(--inf) 16%,transparent);}
+
+  /* primary button */
+  .btn{background:var(--ac);color:var(--act);border-radius:.875rem;font-weight:700;font-family:var(--font-sora),sans-serif;transition:all .18s;box-shadow:0 3px 12px color-mix(in srgb,var(--ac) 28%,transparent);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;}
+  .btn:hover{background:var(--ach);}
+  .btn:active{transform:scale(.97);}
+  .btn:disabled{opacity:.5;cursor:not-allowed;}
+
+  /* icon button */
+  .ibtn{display:flex;align-items:center;justify-content:center;border-radius:.6rem;padding:.35rem;color:var(--fm);transition:all .15s;background:transparent;cursor:pointer;flex-shrink:0;}
+  .ibtn:hover{background:var(--rh);color:var(--fh);}
+
+  /* ── CHAT BUTTON — always visible, amber pill ── */
+  .chat-btn{
+    display:inline-flex;align-items:center;gap:.3rem;
+    border-radius:.8rem;padding:.3rem .65rem;
+    font-size:.7rem;font-weight:700;letter-spacing:.02em;
+    font-family:var(--font-sora),sans-serif;white-space:nowrap;flex-shrink:0;
+    background:color-mix(in srgb,var(--ac) 15%,transparent);
+    border:1.5px solid color-mix(in srgb,var(--ac) 42%,transparent);
+    color:var(--ac);cursor:pointer;transition:all .18s;
   }
-  .fl-blob {
-    position: fixed; border-radius: 50%; filter: blur(80px); pointer-events: none;
-    animation: fl-blob 10s ease-in-out infinite alternate;
-  }
-  @keyframes fl-blob { from{transform:translate(0,0) scale(1);} to{transform:translate(25px,-20px) scale(1.05);} }
-  .fl-blob:nth-child(2) { animation-delay: -5s; }
-  .fl-grid {
-    background-image: linear-gradient(rgba(99,102,241,0.025) 1px,transparent 1px),
-      linear-gradient(90deg, rgba(99,102,241,0.025) 1px,transparent 1px);
-    background-size: 36px 36px;
-  }
-  .fl-panel {
-    background: var(--fl-glass); border: 1px solid var(--fl-glass-border);
-    box-shadow: var(--fl-glass-shadow); border-radius: 1.35rem;
-    backdrop-filter: blur(28px) saturate(180%);
-    -webkit-backdrop-filter: blur(28px) saturate(180%);
-  }
-  .fl-card {
-    background: var(--fl-glass); border: 1px solid var(--fl-glass-border);
-    box-shadow: var(--fl-glass-shadow); border-radius: 1.15rem;
-    backdrop-filter: blur(24px) saturate(175%);
-    -webkit-backdrop-filter: blur(24px) saturate(175%);
-    transition: transform 0.18s ease, box-shadow 0.18s ease;
-    overflow: hidden;
-  }
-  .fl-card:hover { transform: translateY(-2px); box-shadow: 0 14px 44px rgba(0,0,0,0.12); }
-  .fl-stat {
-    background: var(--fl-glass); border: 1px solid var(--fl-glass-border);
-    box-shadow: var(--fl-glass-shadow); border-radius: 1.15rem;
-    backdrop-filter: blur(22px) saturate(170%);
-    -webkit-backdrop-filter: blur(22px) saturate(170%);
-    transition: transform 0.2s; padding: 1rem; text-align: center;
-  }
-  .fl-stat:hover { transform: translateY(-2px); }
-  .fl-input {
-    width: 100%; background: var(--fl-input-bg);
-    border: 1.5px solid var(--fl-input-border); border-radius: 0.875rem;
-    color: var(--fl-input-text); font-family: var(--font-dm), system-ui, sans-serif;
-    transition: border-color 0.18s, box-shadow 0.18s; outline: none;
-    padding: 0.625rem 0.875rem; font-size: 0.875rem;
-  }
-  .fl-input::placeholder { color: var(--fl-placeholder); }
-  .fl-input:focus {
-    border-color: var(--fl-input-focus);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--fl-input-focus) 18%, transparent);
-  }
-  .fl-btn {
-    background: var(--fl-btn-bg); color: var(--fl-btn-text); border-radius: 0.875rem;
-    font-weight: 700; font-family: var(--font-sora), sans-serif; transition: all 0.18s;
-    box-shadow: 0 4px 14px color-mix(in srgb, var(--fl-btn-bg) 30%, transparent);
-  }
-  .fl-btn:hover  { background: var(--fl-btn-hover); }
-  .fl-btn:active { transform: scale(0.97); }
-  .fl-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-  .fl-icon-btn {
-    display: flex; align-items: center; justify-content: center;
-    border-radius: 0.625rem; padding: 0.375rem; color: var(--fl-muted);
-    transition: all 0.15s; background: transparent;
-  }
-  .fl-icon-btn:hover { background: var(--fl-row-hover); color: var(--fl-heading); }
-  .fl-tab {
-    border-radius: 0.875rem; padding: 0.35rem 0.875rem; font-size: 0.75rem;
-    font-weight: 600; color: var(--fl-muted); border: 1px solid transparent;
-    transition: all 0.15s; white-space: nowrap;
-    font-family: var(--font-sora), sans-serif; background: transparent;
-  }
-  .fl-tab:hover { color: var(--fl-subtext); background: var(--fl-glass-2); }
-  .fl-tab-active {
-    background: color-mix(in srgb, var(--fl-accent) 15%, transparent) !important;
-    border-color: color-mix(in srgb, var(--fl-accent) 40%, transparent) !important;
-    color: var(--fl-accent) !important;
-  }
+  .chat-btn:hover{background:color-mix(in srgb,var(--ac) 25%,transparent);transform:translateY(-1px);}
+  .chat-btn:active{transform:scale(.96);}
+
+  /* filter tabs */
+  .tab{border-radius:.8rem;padding:.3rem .75rem;font-size:.72rem;font-weight:600;color:var(--fm);border:1px solid transparent;transition:all .14s;white-space:nowrap;font-family:var(--font-sora),sans-serif;background:transparent;cursor:pointer;}
+  .tab:hover{color:var(--fs);background:var(--gl2);}
+  .tab-on{background:color-mix(in srgb,var(--ac) 14%,transparent)!important;border-color:color-mix(in srgb,var(--ac) 38%,transparent)!important;color:var(--ac)!important;}
+
   /* drop zone */
-  .fl-drop {
-    border: 2px dashed var(--fl-drop-border); border-radius: 1.15rem;
-    transition: all 0.2s; cursor: pointer;
-    background: transparent;
-  }
-  .fl-drop:hover, .fl-drop-active { border-color: var(--fl-accent) !important; background: var(--fl-drop-hover) !important; }
+  .dz{border:2px dashed var(--db);border-radius:1rem;transition:all .2s;cursor:pointer;background:transparent;}
+  .dz:hover,.dz-on{border-color:var(--ac)!important;background:var(--dh)!important;}
+
   /* progress */
-  .fl-progress-track { height: 4px; width: 100%; border-radius: 9999px; background: var(--fl-progress-track); overflow: hidden; }
-  .fl-progress-fill  { height: 100%; border-radius: 9999px; background: var(--fl-accent); transition: width 0.3s ease; }
-  /* chat modal */
-  .fl-chat-modal {
-    background: var(--fl-glass); border: 1px solid var(--fl-glass-border);
-    border-radius: 1.5rem; backdrop-filter: blur(36px) saturate(200%);
-    -webkit-backdrop-filter: blur(36px) saturate(200%);
-    box-shadow: 0 24px 80px rgba(0,0,0,0.28); width: 100%; max-width: 36rem;
-    position: relative; z-index: 10; display: flex; flex-direction: column;
-    height: 85vh; max-height: 700px;
+  .pt{height:4px;width:100%;border-radius:9999px;background:var(--pt);overflow:hidden;}
+  .pf{height:100%;border-radius:9999px;background:var(--ac);transition:width .28s;}
+
+  /* ── CHAT MODAL ── */
+  /* On mobile: slides up from bottom, full width, ~95vh */
+  /* On desktop: centered, max-width 44rem, max-height 86vh */
+  .chat-modal{
+    background:var(--gl);
+    border:1px solid var(--glb);
+    box-shadow:0 -6px 40px rgba(0,0,0,.22),0 0 0 1px var(--glb);
+    backdrop-filter:blur(32px) saturate(190%);
+    -webkit-backdrop-filter:blur(32px) saturate(190%);
+    display:flex;flex-direction:column;
+    position:relative;z-index:10;
+    width:100%;
+    border-radius:1.5rem 1.5rem 0 0;  /* mobile: rounded top only */
+    height:95dvh;                       /* mobile: near full screen */
+    max-height:95dvh;
   }
-  .fl-msg-user      { background: color-mix(in srgb, var(--fl-accent) 14%, transparent); border-radius: 1rem 1rem 0.25rem 1rem; padding: 0.75rem 1rem; }
-  .fl-msg-assistant { background: var(--fl-glass-2); border-radius: 1rem 1rem 1rem 0.25rem; padding: 0.75rem 1rem; }
+  @media(min-width:640px){
+    .chat-modal{
+      border-radius:1.5rem;            /* desktop: all corners */
+      max-width:44rem;
+      height:86vh;
+      max-height:800px;
+      box-shadow:0 24px 80px rgba(0,0,0,.30);
+    }
+  }
+
+  /* slide-up animation for modal */
+  @keyframes modal-up{from{opacity:0;transform:translateY(100%);}to{opacity:1;transform:translateY(0);}}
+  @keyframes modal-fade{from{opacity:0;transform:scale(.96) translateY(12px);}to{opacity:1;transform:scale(1) translateY(0);}}
+  .modal-mob{animation:modal-up .32s cubic-bezier(.22,1,.36,1) both;}
+  @media(min-width:640px){.modal-mob{animation:modal-fade .28s cubic-bezier(.22,1,.36,1) both;}}
+
+  /* chat bubbles */
+  .bu{background:color-mix(in srgb,var(--ac) 14%,transparent);border-radius:1rem 1rem .25rem 1rem;padding:.65rem .9rem;color:var(--fh);}
+  .ba{background:var(--gl2);border-radius:1rem 1rem 1rem .25rem;padding:.65rem .9rem;color:var(--fh);}
+  .be{background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.25);border-radius:1rem 1rem 1rem .25rem;padding:.65rem .9rem;color:#f87171;}
+
   /* toast */
-  .fl-toast {
-    background: var(--fl-glass); border: 1px solid var(--fl-glass-border);
-    border-radius: 9999px; backdrop-filter: blur(24px);
-    box-shadow: var(--fl-glass-shadow); padding: 0.625rem 1.25rem;
-    font-size: 0.875rem; color: var(--fl-heading);
+  .toast{background:var(--gl);border:1px solid var(--glb);border-radius:9999px;backdrop-filter:blur(20px);box-shadow:var(--sh);padding:.55rem 1.1rem;font-size:.85rem;color:var(--fh);}
+
+  /* animations */
+  @keyframes sup{from{opacity:0;transform:translateY(12px);}to{opacity:1;transform:translateY(0);}}
+  .an{opacity:0;animation:sup .44s cubic-bezier(.22,1,.36,1) forwards;}
+  @keyframes shim{from{background-position:-400px 0;}to{background-position:400px 0;}}
+  .shim{background:linear-gradient(90deg,var(--gl) 25%,color-mix(in srgb,var(--gl) 78%,white) 50%,var(--gl) 75%);background-size:800px 100%;animation:shim 1.5s infinite;}
+  @keyframes bonce{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+  .bonce{animation:bonce 2.2s ease-in-out infinite;}
+  @keyframes dot{0%,100%{opacity:1}50%{opacity:.3}}
+  .dot{animation:dot 1.4s ease infinite;}
+  .dot:nth-child(2){animation-delay:.2s;}.dot:nth-child(3){animation-delay:.4s;}
+
+  /* colours */
+  .ch{color:var(--fh);}.cs{color:var(--fs);}.cm{color:var(--fm);}.ca{color:var(--ac);}
+  .dvl{background:var(--dv);}
+
+  /* scroll */
+  .scr::-webkit-scrollbar{width:3px;}
+  .scr::-webkit-scrollbar-track{background:transparent;}
+  .scr::-webkit-scrollbar-thumb{background:var(--glb);border-radius:3px;}
+
+  /* mobile filter scroll */
+  .tab-row{display:flex;gap:.375rem;overflow-x:auto;padding-bottom:2px;-webkit-overflow-scrolling:touch;}
+  .tab-row::-webkit-scrollbar{display:none;}
+
+  /* file card action row — always show on mobile, hover on desktop */
+  .act-row{display:flex;align-items:center;gap:.5rem;margin-top:.625rem;}
+  @media(min-width:640px){
+    .act-row{margin-top:0;opacity:0;transition:opacity .15s;}
+    .card .act-row{opacity:1;}
+    .act-row .chat-btn{opacity:1!important;}
   }
-  .fl-fab {
-    background: var(--fl-btn-bg); color: var(--fl-btn-text); border-radius: 9999px;
-    box-shadow: 0 6px 24px color-mix(in srgb, var(--fl-btn-bg) 40%, transparent);
-    transition: all 0.2s; width: 3.5rem; height: 3.5rem;
-    display: flex; align-items: center; justify-content: center;
+
+  /* FAB — floating upload button on mobile */
+  .fab{
+    position:fixed;bottom:1.5rem;right:1.25rem;z-index:40;
+    width:3.25rem;height:3.25rem;border-radius:9999px;
+    background:var(--ac);color:var(--act);
+    box-shadow:0 6px 20px color-mix(in srgb,var(--ac) 42%,transparent);
+    display:flex;align-items:center;justify-content:center;
+    cursor:pointer;transition:all .2s;border:none;
   }
-  .fl-fab:hover { background: var(--fl-btn-hover); transform: scale(1.07) translateY(-1px); }
-  @keyframes fl-slide-up { from{opacity:0;transform:translateY(16px);} to{opacity:1;transform:translateY(0);} }
-  .fl-animate { opacity:0; animation: fl-slide-up 0.48s cubic-bezier(0.22,1,0.36,1) forwards; }
-  @keyframes fl-shimmer { from{background-position:-400px 0;} to{background-position:400px 0;} }
-  .fl-shimmer {
-    background: linear-gradient(90deg, var(--fl-glass) 25%, color-mix(in srgb,var(--fl-glass) 80%,white) 50%, var(--fl-glass) 75%);
-    background-size: 800px 100%; animation: fl-shimmer 1.5s infinite;
-  }
-  .fl-heading { color: var(--fl-heading); }
-  .fl-subtext { color: var(--fl-subtext); }
-  .fl-muted   { color: var(--fl-muted);   }
-  .fl-accent  { color: var(--fl-accent);  }
-  .fl-divider-line { background: var(--fl-divider); }
-  @keyframes fl-bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
-  .fl-empty-bounce { animation: fl-bounce 2.2s ease-in-out infinite; }
-  .fl-scroll::-webkit-scrollbar { width: 4px; }
-  .fl-scroll::-webkit-scrollbar-track { background: transparent; }
-  .fl-scroll::-webkit-scrollbar-thumb { background: var(--fl-glass-border); border-radius: 4px; }
-  @keyframes fl-dot-pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  .fl-dot-pulse { animation: fl-dot-pulse 1.4s ease infinite; }
-  .fl-dot-pulse:nth-child(2) { animation-delay: 0.2s; }
-  .fl-dot-pulse:nth-child(3) { animation-delay: 0.4s; }
+  .fab:hover{background:var(--ach);transform:scale(1.06);}
+  .fab:active{transform:scale(.95);}
 `;
 
-// ─── Upload Zone ───────────────────────────────────────────────────────────────
+function StorageRing({ used, total }: { used: number; total: number }) {
+  const R = 40,
+    cx = 50,
+    cy = 50,
+    sw = 9;
+  const C = 2 * Math.PI * R;
+  const p = total > 0 ? Math.min(used / total, 1) : 0;
+  return (
+    <div className="flex items-center gap-4">
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <circle
+          cx={cx}
+          cy={cy}
+          r={R}
+          fill="none"
+          stroke="var(--pt)"
+          strokeWidth={sw}
+        />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={R}
+          fill="none"
+          stroke="var(--ac)"
+          strokeWidth={sw}
+          strokeDasharray={`${p * C} ${(1 - p) * C}`}
+          strokeDashoffset={C / 4}
+          strokeLinecap="round"
+          transform={`rotate(-90 ${cx} ${cy})`}
+          style={{ transition: "stroke-dasharray .6s ease" }}
+        />
+        <text
+          x={cx}
+          y={cy - 4}
+          textAnchor="middle"
+          fill="var(--fh)"
+          fontSize="12"
+          fontWeight="700"
+          fontFamily="var(--font-sora),sans-serif"
+        >
+          {Math.round(p * 100)}%
+        </text>
+        <text
+          x={cx}
+          y={cy + 10}
+          textAnchor="middle"
+          fill="var(--fm)"
+          fontSize="8"
+        >
+          used
+        </text>
+      </svg>
+      <div>
+        <p className="cm text-xs">Storage used</p>
+        <p
+          className="ch text-base font-bold tabular-nums mt-0.5"
+          style={{ fontFamily: "var(--font-sora),sans-serif" }}
+        >
+          {(used / 1024 / 1024).toFixed(1)} MB
+        </p>
+        <p className="cm text-xs">of {(total / 1024 / 1024).toFixed(0)} MB</p>
+      </div>
+    </div>
+  );
+}
+
 function UploadZone({
   onUpload,
+  onClose,
 }: {
-  onUpload: (file: File, desc: string) => Promise<void>;
+  onUpload: (f: File, d: string) => Promise<void>;
+  onClose?: () => void;
 }) {
-  const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [description, setDescription] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [drag, setDrag] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [pct, setPct] = useState(0);
+  const [desc, setDesc] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const ref = useRef<HTMLInputElement>(null);
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const file = e.dataTransfer.files[0];
-    if (file) setSelectedFile(file);
-  };
-
-  const handleUpload = async () => {
-    if (!selectedFile) return;
-    setUploading(true);
-    setProgress(0);
-    const interval = setInterval(
-      () => setProgress((p) => (p < 85 ? p + 12 : p)),
-      200,
-    );
+  const go = async () => {
+    if (!file) return;
+    setBusy(true);
+    setPct(0);
+    setErr(null);
+    const iv = setInterval(() => setPct((p) => (p < 82 ? p + 10 : p)), 180);
     try {
-      await onUpload(selectedFile, description);
-      setProgress(100);
+      await onUpload(file, desc);
+      setPct(100);
       setTimeout(() => {
-        setSelectedFile(null);
-        setDescription("");
-        setProgress(0);
-      }, 600);
+        setFile(null);
+        setDesc("");
+        setPct(0);
+        onClose?.();
+      }, 700);
+    } catch (e) {
+      setErr((e as Error).message);
     } finally {
-      clearInterval(interval);
-      setUploading(false);
+      clearInterval(iv);
+      setBusy(false);
     }
   };
 
   return (
-    <div className="fl-panel p-5">
-      <h3
-        className="fl-heading text-sm font-bold mb-4"
-        style={{ fontFamily: "var(--font-sora), sans-serif" }}
-      >
-        📤 Upload File
-      </h3>
+    <div>
       <div
         onDragOver={(e) => {
           e.preventDefault();
-          setDragging(true);
+          setDrag(true);
         }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
-        onClick={() => !selectedFile && inputRef.current?.click()}
-        className={`fl-drop flex flex-col items-center justify-center py-8 ${dragging ? "fl-drop-active" : ""}`}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDrag(false);
+          const f = e.dataTransfer.files[0];
+          if (f) {
+            setFile(f);
+            setErr(null);
+          }
+        }}
+        onClick={() => !file && ref.current?.click()}
+        className={`dz flex flex-col items-center justify-center py-8 px-4 ${drag ? "dz-on" : ""}`}
       >
         <input
-          ref={inputRef}
+          ref={ref}
           type="file"
           className="hidden"
           onChange={(e) => {
             const f = e.target.files?.[0];
-            if (f) setSelectedFile(f);
+            if (f) {
+              setFile(f);
+              setErr(null);
+            }
           }}
         />
-        {selectedFile ? (
+        {file ? (
           <div className="text-center">
-            <div className="text-4xl mb-2">
-              {getFileIcon(selectedFile.type)}
-            </div>
+            <div className="text-4xl mb-2">{fileIcon(file.type)}</div>
             <p
-              className="fl-heading text-sm font-semibold"
-              style={{ fontFamily: "var(--font-sora), sans-serif" }}
+              className="ch text-sm font-semibold"
+              style={{ fontFamily: "var(--font-sora),sans-serif" }}
             >
-              {selectedFile.name}
+              {file.name}
             </p>
-            <p className="fl-muted text-xs mt-1">
-              {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+            <p className="cm text-xs mt-1">
+              {(file.size / 1024 / 1024).toFixed(2)} MB
             </p>
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                setSelectedFile(null);
+                setFile(null);
+                setErr(null);
               }}
-              className="mt-2 text-xs transition-colors"
+              className="mt-2 text-xs"
               style={{ color: "#f87171" }}
-              onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.7")}
-              onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
             >
               Remove
             </button>
@@ -306,47 +532,43 @@ function UploadZone({
             <div
               className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl mx-auto text-2xl"
               style={{
-                background:
-                  "color-mix(in srgb, var(--fl-accent) 13%, transparent)",
+                background: "color-mix(in srgb,var(--ac) 13%,transparent)",
                 border:
-                  "1px solid color-mix(in srgb, var(--fl-accent) 30%, transparent)",
+                  "1px solid color-mix(in srgb,var(--ac) 28%,transparent)",
               }}
             >
               ☁️
             </div>
-            <p className="fl-subtext text-sm font-medium">
-              Drag & drop or{" "}
-              <span style={{ color: "var(--fl-accent)" }}>browse</span>
-            </p>
-            <p className="fl-muted text-xs mt-1">
-              PDFs, images, videos, audio, docs
-            </p>
+            <p className="cs text-sm font-medium">Tap or drag & drop</p>
+            <p className="cm text-xs mt-1">PDFs, images, videos, audio, docs</p>
           </div>
         )}
       </div>
 
-      {selectedFile && (
+      {file && (
         <div className="mt-4 space-y-3">
           <input
-            className="fl-input"
+            className="inp"
             placeholder="Optional description…"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
+            value={desc}
+            onChange={(e) => setDesc(e.target.value)}
           />
-          {uploading && (
-            <div className="fl-progress-track">
-              <div
-                className="fl-progress-fill"
-                style={{ width: `${progress}%` }}
-              />
+          {busy && (
+            <div className="pt">
+              <div className="pf" style={{ width: `${pct}%` }} />
             </div>
           )}
+          {err && (
+            <p className="text-xs" style={{ color: "#f87171" }}>
+              ⚠️ {err}
+            </p>
+          )}
           <button
-            onClick={handleUpload}
-            disabled={uploading}
-            className="fl-btn w-full py-3 text-sm"
+            onClick={go}
+            disabled={busy}
+            className="btn w-full py-3 text-sm"
           >
-            {uploading ? `Uploading… ${progress}%` : "Upload File"}
+            {busy ? `Uploading… ${pct}%` : "Upload File"}
           </button>
         </div>
       )}
@@ -354,107 +576,129 @@ function UploadZone({
   );
 }
 
-// ─── PDF Chat Panel ────────────────────────────────────────────────────────────
-function PdfChatPanel({
-  file,
-  onClose,
-}: {
-  file: FileEntry;
-  onClose: () => void;
-}) {
-  const [messages, setMessages] = useState<
-    { role: "user" | "assistant"; content: string }[]
-  >([]);
+// ─── PDF Chat Modal ───────────────────────────────────────────────────────────
+function PdfChat({ file, onClose }: { file: FileEntry; onClose: () => void }) {
+  const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [preparing, setPreparing] = useState(true);
-  const [wordCount, setWordCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [prepErr, setPrepErr] = useState<string | null>(null);
+  const [wc, setWc] = useState<number | null>(null);
+  const [prepMsg, setPrepMsg] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
+  // Prepare: GET /api/chat/pdf/{fileId}/prepare
   useEffect(() => {
-    fileApi
-      .preparePdf(file.id)
-      .then((info) => setWordCount(info.wordCount ?? 0))
-      .catch(() => {})
-      .finally(() => setPreparing(false));
+    api
+      .prepare(file.id)
+      .then((d) => {
+        setWc(d.wordCount ?? null);
+        setPrepMsg(d.message ?? null);
+      })
+      .catch((e) => setPrepErr((e as Error).message))
+      .finally(() => {
+        setLoading(false);
+        setTimeout(() => inputRef.current?.focus(), 200);
+      });
   }, [file.id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [msgs, busy]);
 
-  const handleSend = async () => {
-    const q = input.trim();
-    if (!q || loading) return;
+  // Send: POST /api/chat/pdf
+  const send = async (text?: string) => {
+    const q = (text ?? input).trim();
+    if (!q || busy || loading || prepErr) return;
     setInput("");
-    const userMsg = { role: "user" as const, content: q };
-    setMessages((prev) => [...prev, userMsg]);
-    setLoading(true);
+    const um: ChatMessage = { role: "user", content: q };
+    setMsgs((prev) => [...prev, um]);
+    setBusy(true);
     try {
-      const res = await fileApi.chatWithPdf(file.id, q, messages);
-      setMessages((prev) => [
+      const answer = await api.chat(file.id, q, [...msgs, um]);
+      setMsgs((prev) => [...prev, { role: "assistant", content: answer }]);
+    } catch (e) {
+      setMsgs((prev) => [
         ...prev,
-        { role: "assistant", content: res.answer },
-      ]);
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, couldn't process that. Try again.",
-        },
+        { role: "assistant", content: `⚠️ ${(e as Error).message}` },
       ]);
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
   const starters = [
     "Summarize this document",
     "What are the key points?",
-    "List the main topics",
+    "List all main topics",
+    "What is the conclusion?",
   ];
 
   return (
+    /* Full-screen overlay */
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
-      style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(8px)" }}
+      className="fixed inset-0 z-50 flex flex-col items-end justify-end sm:items-center sm:justify-center sm:p-4"
+      style={{ background: "rgba(0,0,0,0.60)", backdropFilter: "blur(10px)" }}
     >
+      {/* Backdrop tap to close */}
       <div className="absolute inset-0" onClick={onClose} />
+
+      {/* Modal — slides up from bottom on mobile, scales in on desktop */}
       <div
-        className="fl-chat-modal fl-animate"
+        className="chat-modal modal-mob"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
+        {/* ── Header ─────────────────────────────────────── */}
         <div
-          className="shrink-0 flex items-center justify-between border-b px-5 py-4"
-          style={{ borderColor: "var(--fl-divider)" }}
+          className="shrink-0 flex items-center gap-3 border-b px-4 py-3.5 sm:px-5 sm:py-4"
+          style={{ borderColor: "var(--dv)" }}
         >
-          <div className="flex items-center gap-3 min-w-0">
-            <div
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-lg"
-              style={{
-                background:
-                  "color-mix(in srgb, var(--fl-accent) 13%, transparent)",
-              }}
+          {/* Mobile drag handle */}
+          <div
+            className="absolute top-2.5 left-1/2 -translate-x-1/2 w-10 h-1 rounded-full sm:hidden"
+            style={{ background: "var(--glb)" }}
+          />
+
+          <div
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-lg"
+            style={{
+              background: "color-mix(in srgb,var(--ac) 14%,transparent)",
+              border: "1px solid color-mix(in srgb,var(--ac) 30%,transparent)",
+            }}
+          >
+            📕
+          </div>
+
+          <div className="flex-1 min-w-0">
+            <p
+              className="ch text-sm font-semibold truncate"
+              style={{ fontFamily: "var(--font-sora),sans-serif" }}
             >
-              📕
-            </div>
-            <div className="min-w-0">
-              <p
-                className="fl-heading text-sm font-semibold truncate"
-                style={{ fontFamily: "var(--font-sora), sans-serif" }}
+              {file.originalFileName}
+            </p>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[9px] font-bold"
+                style={{
+                  background: "color-mix(in srgb,var(--ac) 14%,transparent)",
+                  color: "var(--ac)",
+                  border:
+                    "1px solid color-mix(in srgb,var(--ac) 35%,transparent)",
+                  fontFamily: "var(--font-sora),sans-serif",
+                }}
               >
-                {file.originalFileName}
-              </p>
-              {wordCount > 0 && (
-                <p className="fl-muted text-[10px]">
-                  {wordCount.toLocaleString()} words · Groq AI
-                </p>
+                Groq AI
+              </span>
+              {wc !== null && (
+                <span className="cm text-[10px]">
+                  {wc.toLocaleString()} words
+                </span>
               )}
             </div>
           </div>
-          <button onClick={onClose} className="fl-icon-btn shrink-0">
+
+          <button onClick={onClose} className="ibtn shrink-0">
             <svg
               className="h-5 w-5"
               fill="none"
@@ -471,51 +715,74 @@ function PdfChatPanel({
           </button>
         </div>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 fl-scroll">
-          {preparing ? (
+        <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-5 scr">
+          {loading && (
             <div className="flex flex-col items-center justify-center h-full gap-3">
               <div
-                className="h-8 w-8 rounded-full border-2 animate-spin"
+                className="h-9 w-9 rounded-full border-2 animate-spin"
                 style={{
-                  borderColor:
-                    "color-mix(in srgb, var(--fl-accent) 30%, transparent)",
-                  borderTopColor: "var(--fl-accent)",
+                  borderColor: "color-mix(in srgb,var(--ac) 25%,transparent)",
+                  borderTopColor: "var(--ac)",
                 }}
               />
-              <p className="fl-subtext text-sm">Preparing PDF for chat…</p>
+              <p className="cs text-sm">Indexing PDF content…</p>
+              <p className="cm text-xs">This may take a few seconds</p>
             </div>
-          ) : messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-center gap-3">
+          )}
+
+          {!loading && prepErr && (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-4">
+              <div className="text-5xl">⚠️</div>
+              <p
+                className="ch text-base font-bold"
+                style={{ fontFamily: "var(--font-sora),sans-serif" }}
+              >
+                Could not prepare PDF
+              </p>
+              <p className="cm text-sm max-w-xs">{prepErr}</p>
+              <button
+                onClick={onClose}
+                className="btn px-5 py-2.5 text-sm mt-2"
+              >
+                Close
+              </button>
+            </div>
+          )}
+
+          {!loading && !prepErr && msgs.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full text-center gap-3 px-2">
               <div className="text-5xl">🤖</div>
               <p
-                className="fl-heading text-base font-bold"
-                style={{ fontFamily: "var(--font-sora), sans-serif" }}
+                className="ch text-base font-bold"
+                style={{ fontFamily: "var(--font-sora),sans-serif" }}
               >
                 Ask anything about this PDF
               </p>
-              <p className="fl-muted text-sm max-w-xs">
-                I've analysed the document. What do you want to know?
+              <p className="cm text-sm max-w-xs">
+                {prepMsg ??
+                  "I've indexed the document. What would you like to know?"}
               </p>
-              <div className="mt-3 flex flex-wrap justify-center gap-2">
+              {/* Starter chips — scrollable row on mobile */}
+              <div className="w-full mt-3 flex flex-wrap justify-center gap-2">
                 {starters.map((s) => (
                   <button
                     key={s}
-                    onClick={() => setInput(s)}
-                    className="rounded-full px-3 py-1.5 text-xs fl-subtext transition-all"
+                    onClick={() => send(s)}
+                    className="rounded-full px-3.5 py-2 text-xs cs transition-all"
                     style={{
-                      border: "1px solid var(--fl-input-border)",
-                      background: "var(--fl-glass-2)",
+                      border: "1px solid var(--inbd)",
+                      background: "var(--gl2)",
                     }}
                     onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLElement).style.borderColor =
-                        "color-mix(in srgb, var(--fl-accent) 40%, transparent)";
-                      (e.currentTarget as HTMLElement).style.color =
-                        "var(--fl-accent)";
+                      const el = e.currentTarget as HTMLElement;
+                      el.style.borderColor =
+                        "color-mix(in srgb,var(--ac) 45%,transparent)";
+                      el.style.color = "var(--ac)";
                     }}
                     onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLElement).style.borderColor = "";
-                      (e.currentTarget as HTMLElement).style.color = "";
+                      const el = e.currentTarget as HTMLElement;
+                      el.style.borderColor = "";
+                      el.style.color = "";
                     }}
                   >
                     {s}
@@ -523,45 +790,56 @@ function PdfChatPanel({
                 ))}
               </div>
             </div>
-          ) : (
+          )}
+
+          {!loading && !prepErr && msgs.length > 0 && (
             <div className="space-y-4">
-              {messages.map((m, i) => (
+              {msgs.map((m, i) => (
                 <div
                   key={i}
-                  className={`flex gap-3 ${m.role === "user" ? "flex-row-reverse" : ""}`}
+                  className={`flex gap-2.5 ${m.role === "user" ? "flex-row-reverse" : ""}`}
                 >
+                  {/* Avatar */}
                   <div
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm"
                     style={{
                       background:
                         m.role === "user"
-                          ? "color-mix(in srgb, var(--fl-accent) 18%, transparent)"
-                          : "var(--fl-glass-2)",
+                          ? "color-mix(in srgb,var(--ac) 18%,transparent)"
+                          : "var(--gl2)",
                     }}
                   >
                     {m.role === "user" ? "👤" : "🤖"}
                   </div>
+                  {/* Bubble */}
                   <div
-                    className={`max-w-[80%] text-sm leading-relaxed fl-heading ${m.role === "user" ? "fl-msg-user" : "fl-msg-assistant"}`}
+                    className={`max-w-[82%] text-sm leading-relaxed whitespace-pre-wrap ${
+                      m.role === "user"
+                        ? "bu"
+                        : m.content.startsWith("⚠️")
+                          ? "be"
+                          : "ba"
+                    }`}
                   >
                     {m.content}
                   </div>
                 </div>
               ))}
-              {loading && (
-                <div className="flex gap-3">
+
+              {busy && (
+                <div className="flex gap-2.5">
                   <div
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-sm"
-                    style={{ background: "var(--fl-glass-2)" }}
+                    style={{ background: "var(--gl2)" }}
                   >
                     🤖
                   </div>
-                  <div className="fl-msg-assistant flex items-center gap-1.5">
+                  <div className="ba flex items-center gap-1.5">
                     {[0, 1, 2].map((i) => (
                       <div
                         key={i}
-                        className="h-1.5 w-1.5 rounded-full fl-dot-pulse"
-                        style={{ background: "var(--fl-accent)" }}
+                        className="h-1.5 w-1.5 rounded-full dot"
+                        style={{ background: "var(--ac)" }}
                       />
                     ))}
                   </div>
@@ -572,27 +850,26 @@ function PdfChatPanel({
           )}
         </div>
 
-        {/* Input */}
+        {/* ── Input bar ─────────────────────────────────── */}
         <div
-          className="shrink-0 px-4 py-3 border-t"
-          style={{ borderColor: "var(--fl-divider)" }}
+          className="shrink-0 border-t px-3 py-3 sm:px-4 sm:py-3.5"
+          style={{ borderColor: "var(--dv)" }}
         >
           <div className="flex items-center gap-2">
             <input
-              className="fl-input flex-1 py-2.5 text-sm"
-              placeholder="Ask about this PDF…"
+              ref={inputRef}
+              className="inp flex-1 py-2.5 text-sm"
+              placeholder={loading ? "Preparing…" : "Ask about this PDF…"}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) =>
-                e.key === "Enter" && !e.shiftKey && handleSend()
-              }
-              disabled={preparing || loading}
+              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && send()}
+              disabled={loading || busy || !!prepErr}
             />
             <button
-              onClick={handleSend}
-              disabled={!input.trim() || loading || preparing}
-              className="fl-btn flex h-10 w-10 shrink-0 items-center justify-center rounded-xl"
-              style={{ borderRadius: "0.875rem" }}
+              onClick={() => send()}
+              disabled={!input.trim() || busy || loading || !!prepErr}
+              className="btn h-10 w-10 sm:h-11 sm:w-11 shrink-0 rounded-xl text-sm disabled:opacity-40"
+              style={{ borderRadius: ".875rem" }}
             >
               <svg
                 className="h-4 w-4"
@@ -609,8 +886,8 @@ function PdfChatPanel({
               </svg>
             </button>
           </div>
-          <p className="fl-muted text-center text-[10px] mt-1.5">
-            Enter to send · Powered by Groq AI
+          <p className="cm text-center text-[10px] mt-1.5">
+            Enter to send · Groq AI
           </p>
         </div>
       </div>
@@ -618,7 +895,56 @@ function PdfChatPanel({
   );
 }
 
-// ─── File Card ─────────────────────────────────────────────────────────────────
+// ─── Upload Sheet (mobile bottom-sheet) ──────────────────────────────────────
+function UploadSheet({
+  onUpload,
+  onClose,
+}: {
+  onUpload: (f: File, d: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center sm:items-center sm:p-4"
+      style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(8px)" }}
+    >
+      <div className="absolute inset-0" onClick={onClose} />
+      <div className="relative z-10 w-full sm:max-w-md panel p-5 rounded-t-3xl sm:rounded-2xl modal-mob">
+        {/* drag handle */}
+        <div
+          className="absolute top-2.5 left-1/2 -translate-x-1/2 w-10 h-1 rounded-full sm:hidden"
+          style={{ background: "var(--glb)" }}
+        />
+        <div className="flex items-center justify-between mb-4 mt-2 sm:mt-0">
+          <h3
+            className="ch text-sm font-bold"
+            style={{ fontFamily: "var(--font-sora),sans-serif" }}
+          >
+            📤 Upload File
+          </h3>
+          <button onClick={onClose} className="ibtn">
+            <svg
+              className="h-5 w-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={1.5}
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M6 18L18 6M6 6l12 12"
+              />
+            </svg>
+          </button>
+        </div>
+        <UploadZone onUpload={onUpload} onClose={onClose} />
+      </div>
+    </div>
+  );
+}
+
+// ─── File Card ────────────────────────────────────────────────────────────────
 function FileCard({
   file,
   onDelete,
@@ -628,100 +954,81 @@ function FileCard({
   onDelete: (id: number) => void;
   onChat: (file: FileEntry) => void;
 }) {
-  const cat = CATEGORY_META[file.category];
+  const cat = CAT[file.category] ?? CAT.OTHER;
   const isPdf = file.fileType?.includes("pdf");
-  const [confirmDel, setConfirmDel] = useState(false);
-
-  const handleDownload = () => {
-    const token = document.cookie
-      .split("; ")
-      .find((r) => r.startsWith("token="))
-      ?.split("=")[1];
-    const url = `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080"}/api/files/${file.id}/download`;
-    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => r.blob())
-      .then((blob) => {
-        const link = document.createElement("a");
-        link.href = URL.createObjectURL(blob);
-        link.download = file.originalFileName;
-        link.click();
-      });
-  };
+  const [del, setDel] = useState(false);
 
   return (
-    <div className="fl-card group flex items-center gap-4 p-4">
-      {/* Icon */}
-      <div
-        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl text-2xl"
-        style={{ background: cat.bg, border: `1px solid ${cat.border}` }}
-      >
-        {getFileIcon(file.fileType)}
-      </div>
-
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <p
-          className="fl-heading text-sm font-semibold truncate"
-          style={{ fontFamily: "var(--font-sora), sans-serif" }}
+    <div className="card p-3.5 sm:p-4">
+      <div className="flex items-start gap-3">
+        {/* Icon */}
+        <div
+          className="flex h-10 w-10 sm:h-12 sm:w-12 shrink-0 items-center justify-center rounded-xl sm:rounded-2xl text-xl sm:text-2xl"
+          style={{ background: cat.bg, border: `1px solid ${cat.border}` }}
         >
-          {file.originalFileName}
-        </p>
-        {file.description && (
-          <p className="fl-muted truncate text-xs mt-0.5">{file.description}</p>
-        )}
-        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          <span
-            className="rounded-full px-2 py-0.5 text-[10px] font-semibold border"
+          {fileIcon(file.fileType)}
+        </div>
+
+        {/* Info */}
+        <div className="flex-1 min-w-0">
+          <p
+            className="ch text-sm font-semibold leading-tight"
             style={{
-              background: cat.bg,
-              borderColor: cat.border,
-              color: cat.color,
-              fontFamily: "var(--font-sora), sans-serif",
+              fontFamily: "var(--font-sora),sans-serif",
+              overflow: "hidden",
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
             }}
           >
-            {cat.emoji} {cat.label}
-          </span>
-          <span className="fl-muted text-[10px]">{file.fileSizeFormatted}</span>
-          <span className="fl-muted text-[10px]">
-            {file.uploadedAt
-              ? format(parseISO(file.uploadedAt), "d MMM yyyy")
-              : ""}
-          </span>
-          {file.usedForChat && (
+            {file.originalFileName}
+          </p>
+          {file.description && (
+            <p className="cm text-xs mt-0.5 truncate">{file.description}</p>
+          )}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1">
             <span
-              className="rounded-full px-2 py-0.5 text-[10px] border"
+              className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold border"
               style={{
-                background: "rgba(16,185,129,0.10)",
-                borderColor: "rgba(16,185,129,0.25)",
-                color: "#34d399",
+                background: cat.bg,
+                borderColor: cat.border,
+                color: cat.color,
+                fontFamily: "var(--font-sora),sans-serif",
               }}
             >
-              💬 Chat ready
+              {cat.emoji} {cat.label}
             </span>
-          )}
+            <span className="cm text-[10px]">{file.fileSizeFormatted}</span>
+            <span className="cm text-[10px]">
+              {file.uploadedAt
+                ? format(parseISO(file.uploadedAt), "d MMM yy")
+                : ""}
+            </span>
+            {file.usedForChat && (
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[10px] border"
+                style={{
+                  background: "rgba(52,211,153,.10)",
+                  borderColor: "rgba(52,211,153,.25)",
+                  color: "#34d399",
+                }}
+              >
+                💬 Ready
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="act-row pt-2.5">
+        {/* Chat — always visible on PDFs */}
         {isPdf && (
-          <button
-            onClick={() => onChat(file)}
-            className="flex items-center gap-1 rounded-xl px-2.5 py-1.5 text-xs font-semibold transition-all"
-            style={{
-              background:
-                "color-mix(in srgb, var(--fl-accent) 13%, transparent)",
-              border:
-                "1px solid color-mix(in srgb, var(--fl-accent) 35%, transparent)",
-              color: "var(--fl-accent)",
-              fontFamily: "var(--font-sora), sans-serif",
-            }}
-          >
+          <button onClick={() => onChat(file)} className="chat-btn">
             <svg
               className="h-3.5 w-3.5"
               fill="none"
               stroke="currentColor"
-              strokeWidth={1.5}
+              strokeWidth={2}
               viewBox="0 0 24 24"
             >
               <path
@@ -730,58 +1037,18 @@ function FileCard({
                 d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z"
               />
             </svg>
-            Chat
+            Chat with PDF
           </button>
         )}
-        <button
-          onClick={handleDownload}
-          className="fl-icon-btn"
-          onMouseEnter={(e) => (e.currentTarget.style.color = "#34d399")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "")}
-        >
-          <svg
-            className="h-4 w-4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.5}
-            viewBox="0 0 24 24"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"
-            />
-          </svg>
-        </button>
-        {confirmDel ? (
-          <div className="flex gap-1">
-            <button
-              onClick={() => onDelete(file.id)}
-              className="rounded-lg px-2 py-1 text-[10px] font-bold"
-              style={{ background: "rgba(239,68,68,0.14)", color: "#f87171" }}
-            >
-              Yes
-            </button>
-            <button
-              onClick={() => setConfirmDel(false)}
-              className="rounded-lg px-2 py-1 text-[10px] fl-muted"
-              style={{ background: "var(--fl-glass-2)" }}
-            >
-              No
-            </button>
-          </div>
-        ) : (
+
+        <div className="flex items-center gap-1 ml-auto">
+          {/* Download */}
           <button
-            onClick={() => setConfirmDel(true)}
-            className="fl-icon-btn"
-            onMouseEnter={(e) => {
-              e.currentTarget.style.background = "rgba(239,68,68,0.12)";
-              e.currentTarget.style.color = "#f87171";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "";
-              e.currentTarget.style.color = "";
-            }}
+            onClick={() => api.download(file.id, file.originalFileName)}
+            className="ibtn"
+            title="Download"
+            onMouseEnter={(e) => (e.currentTarget.style.color = "#34d399")}
+            onMouseLeave={(e) => (e.currentTarget.style.color = "")}
           >
             <svg
               className="h-4 w-4"
@@ -793,209 +1060,189 @@ function FileCard({
               <path
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
+                d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"
               />
             </svg>
           </button>
-        )}
+
+          {/* Delete */}
+          {del ? (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => onDelete(file.id)}
+                className="rounded-lg px-2.5 py-1 text-[11px] font-bold"
+                style={{ background: "rgba(239,68,68,.15)", color: "#f87171" }}
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => setDel(false)}
+                className="rounded-lg px-2.5 py-1 text-[11px] cm"
+                style={{ background: "var(--gl2)" }}
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setDel(true)}
+              className="ibtn"
+              title="Delete"
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "rgba(239,68,68,.12)";
+                e.currentTarget.style.color = "#f87171";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "";
+                e.currentTarget.style.color = "";
+              }}
+            >
+              <svg
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
+                />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-// ─── Storage Ring (SVG) ────────────────────────────────────────────────────────
-function StorageRing({ used, total }: { used: number; total: number }) {
-  const R = 44;
-  const cx = 56;
-  const cy = 56;
-  const stroke = 10;
-  const circ = 2 * Math.PI * R;
-  const pct = total > 0 ? Math.min(used / total, 1) : 0;
-  const dash = pct * circ;
-
-  return (
-    <div className="flex items-center gap-4">
-      <svg width="112" height="112" viewBox="0 0 112 112">
-        <circle
-          cx={cx}
-          cy={cy}
-          r={R}
-          fill="none"
-          stroke="var(--fl-progress-track)"
-          strokeWidth={stroke}
-        />
-        <circle
-          cx={cx}
-          cy={cy}
-          r={R}
-          fill="none"
-          stroke="var(--fl-accent)"
-          strokeWidth={stroke}
-          strokeDasharray={`${dash} ${circ - dash}`}
-          strokeDashoffset={circ / 4}
-          strokeLinecap="round"
-          style={{ transition: "stroke-dasharray 0.6s ease" }}
-          transform={`rotate(-90 ${cx} ${cy})`}
-        />
-        <text
-          x={cx}
-          y={cy - 4}
-          textAnchor="middle"
-          fill="var(--fl-heading)"
-          fontSize="13"
-          fontWeight="700"
-          fontFamily="var(--font-sora), sans-serif"
-        >
-          {Math.round(pct * 100)}%
-        </text>
-        <text
-          x={cx}
-          y={cy + 10}
-          textAnchor="middle"
-          fill="var(--fl-muted)"
-          fontSize="8"
-        >
-          used
-        </text>
-      </svg>
-      <div>
-        <p className="fl-muted text-xs">Storage Used</p>
-        <p
-          className="fl-heading text-base font-bold tabular-nums mt-0.5"
-          style={{ fontFamily: "var(--font-sora), sans-serif" }}
-        >
-          {(used / 1024 / 1024).toFixed(1)} MB
-        </p>
-        <p className="fl-muted text-xs">
-          of {(total / 1024 / 1024).toFixed(0)} MB
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// ─── Main Page ─────────────────────────────────────────────────────────────────
 export default function FilesPage() {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [filterCategory, setFilterCategory] = useState<FileCategory | "ALL">(
-    "ALL",
-  );
+  const [filter, setFilter] = useState<FileCategory | "ALL">("ALL");
   const [chatFile, setChatFile] = useState<FileEntry | null>(null);
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [showUpload, setShowUpload] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
-    setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 3000);
+    setToast(msg);
+    setTimeout(() => setToast(null), 3200);
   };
 
   const fetchFiles = useCallback(async () => {
     setLoading(true);
     try {
       let data: FileEntry[];
-      if (search.trim()) data = await fileApi.search(search.trim());
-      else if (filterCategory !== "ALL")
-        data = await fileApi.getByCategory(filterCategory);
-      else data = await fileApi.getAll();
+      if (search.trim()) {
+        data = await api.search(search.trim());
+      } else if (filter === "DOCUMENT") {
+        const [pdfs, docs] = await Promise.all([
+          api.getPdfs(),
+          api.getByCategory("DOCUMENT"),
+        ]);
+        const seen = new Set(pdfs.map((f) => f.id));
+        data = [...pdfs, ...docs.filter((f) => !seen.has(f.id))];
+      } else if (filter !== "ALL") {
+        data = await api.getByCategory(filter);
+      } else {
+        data = await api.getAll();
+      }
       setFiles(data);
-    } catch {
-      showToast("Failed to load files");
+    } catch (e) {
+      showToast(`Failed to load: ${(e as Error).message}`);
     } finally {
       setLoading(false);
     }
-  }, [search, filterCategory]);
+  }, [search, filter]);
 
   const fetchStats = useCallback(async () => {
     try {
-      setStats(await fileApi.getStats());
+      setStats(await api.getStats());
     } catch {
-      /* ignore */
+      /* silent */
     }
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(fetchFiles, 300);
+    const t = setTimeout(fetchFiles, 280);
     return () => clearTimeout(t);
   }, [fetchFiles]);
   useEffect(() => {
     fetchStats();
   }, [fetchStats]);
 
-  const handleUpload = async (file: File, description: string) => {
-    await fileApi.upload(file, description);
-    showToast("File uploaded! 🎉");
+  const handleUpload = async (f: File, d: string) => {
+    await api.upload(f, d);
+    showToast("Uploaded! 🎉");
     fetchFiles();
     fetchStats();
   };
   const handleDelete = async (id: number) => {
-    await fileApi.delete(id);
-    showToast("File deleted");
+    await api.delete(id);
+    showToast("Deleted");
     fetchFiles();
     fetchStats();
   };
 
-  const categories = Object.keys(CATEGORY_META) as FileCategory[];
+  const categories = Object.keys(CAT) as FileCategory[];
   const pdfCount = files.filter((f) => f.fileType?.includes("pdf")).length;
 
   const grouped =
-    filterCategory === "ALL" && !search
+    filter === "ALL" && !search
       ? files.reduce<Record<string, FileEntry[]>>((acc, f) => {
-          const k = f.category;
-          if (!acc[k]) acc[k] = [];
-          acc[k].push(f);
+          if (!acc[f.category]) acc[f.category] = [];
+          acc[f.category].push(f);
           return acc;
         }, {})
       : null;
 
   return (
     <>
-      <style>{FL_CSS}</style>
-      <div className="fl-root">
+      <style>{CSS}</style>
+      <div className="pg">
         <div
-          className="fl-blob"
+          className="blob"
           style={{
-            width: "550px",
-            height: "550px",
-            background: "rgba(245,158,11,0.07)",
-            top: "-130px",
-            right: "-120px",
+            width: "500px",
+            height: "500px",
+            background: "rgba(245,158,11,.07)",
+            top: "-120px",
+            right: "-110px",
           }}
         />
         <div
-          className="fl-blob"
+          className="blob"
           style={{
-            width: "400px",
-            height: "400px",
-            background: "rgba(168,85,247,0.05)",
+            width: "380px",
+            height: "380px",
+            background: "rgba(168,85,247,.05)",
             bottom: "-80px",
-            left: "-90px",
+            left: "-80px",
           }}
         />
         <div
-          className="fl-blob"
+          className="blob"
           style={{
-            width: "280px",
-            height: "280px",
-            background: "rgba(59,130,246,0.04)",
-            top: "40%",
-            left: "35%",
+            width: "250px",
+            height: "250px",
+            background: "rgba(59,130,246,.04)",
+            top: "44%",
+            left: "38%",
           }}
         />
-        <div className="pointer-events-none fixed inset-0 fl-grid opacity-50" />
+        <div className="pointer-events-none fixed inset-0 grd opacity-50" />
 
         <div className="h-[64px]" />
 
-        <div className="relative z-10 mx-auto max-w-4xl px-4 pb-20 pt-8">
-          {/* ── Header ── */}
-          <div
-            className="fl-animate mb-8 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"
-            style={{ animationDelay: "40ms" }}
-          >
-            <div>
+        <div className="relative z-10 mx-auto max-w-4xl px-3 sm:px-4 pb-24 pt-6 sm:pt-8">
+          <div className="an mb-6 sm:mb-8" style={{ animationDelay: "40ms" }}>
+            <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 mb-1">
-                <Link href="/dashboard" className="fl-icon-btn">
+                <Link href="/dashboard" className="ibtn">
                   <svg
                     className="h-5 w-5"
                     fill="none"
@@ -1011,45 +1258,58 @@ export default function FilesPage() {
                   </svg>
                 </Link>
                 <span className="text-xl">📁</span>
-                <p className="fl-muted text-xs font-semibold uppercase tracking-widest">
+                <p className="cm text-xs font-semibold uppercase tracking-widest">
                   {stats
-                    ? `${stats.totalFiles} files · ${stats.totalFormatted} used`
-                    : "File Storage"}
+                    ? `${stats.totalFiles} files · ${stats.totalFormatted}`
+                    : "Files"}
                 </p>
               </div>
-              <h1
-                className="fl-heading text-3xl font-extrabold tracking-tight sm:text-4xl"
-                style={{ fontFamily: "var(--font-sora), sans-serif" }}
+              <button
+                onClick={() => setShowUpload(true)}
+                className="btn hidden sm:flex items-center gap-2 px-4 py-2.5 text-sm"
               >
-                File Storage
-              </h1>
-              <p className="fl-subtext mt-1.5 text-sm">
-                Upload anything. Chat with PDFs using Groq AI.
-              </p>
+                <svg
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2.5}
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 4.5v15m7.5-7.5h-15"
+                  />
+                </svg>
+                Upload
+              </button>
             </div>
+            <h1
+              className="ch text-2xl sm:text-4xl font-extrabold tracking-tight"
+              style={{ fontFamily: "var(--font-sora),sans-serif" }}
+            >
+              File Storage
+            </h1>
+            <p className="cs mt-1 text-sm">
+              Upload & organise files. Chat with PDFs using Groq AI.
+            </p>
           </div>
 
-          {/* Stats */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 mb-6">
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 mb-5">
             {[
               {
-                label: "Total Files",
+                label: "Total",
                 value: stats?.totalFiles ?? 0,
                 icon: "📁",
-                color: "var(--fl-heading)",
+                color: "var(--fh)",
               },
               {
-                label: "Storage",
+                label: "Used",
                 value: stats?.totalFormatted ?? "0 B",
                 icon: "💾",
-                color: "var(--fl-accent)",
+                color: "var(--ac)",
               },
-              {
-                label: "PDFs (AI)",
-                value: pdfCount,
-                icon: "📕",
-                color: "#f87171",
-              },
+              { label: "PDFs", value: pdfCount, icon: "📕", color: "#f87171" },
               {
                 label: "Images",
                 value: files.filter((f) => f.category === "IMAGE").length,
@@ -1059,236 +1319,302 @@ export default function FilesPage() {
             ].map((s, i) => (
               <div
                 key={s.label}
-                className="fl-stat fl-animate"
-                style={{ animationDelay: `${80 + i * 45}ms` }}
+                className="stat an"
+                style={{ animationDelay: `${80 + i * 40}ms` }}
               >
-                <div className="text-xl mb-1">{s.icon}</div>
+                <div className="text-lg mb-0.5">{s.icon}</div>
                 <p
-                  className="text-xl font-bold tabular-nums"
+                  className="text-lg sm:text-xl font-bold tabular-nums leading-tight"
                   style={{
                     color: s.color,
-                    fontFamily: "var(--font-sora), sans-serif",
+                    fontFamily: "var(--font-sora),sans-serif",
                   }}
                 >
                   {s.value}
                 </p>
-                <p className="fl-muted text-xs mt-0.5">{s.label}</p>
+                <p className="cm text-[10px] sm:text-xs mt-0.5">{s.label}</p>
               </div>
             ))}
           </div>
 
-          {/* Main grid */}
-          <div className="grid gap-5 lg:grid-cols-[1fr_300px]">
-            {/* Left — list */}
-            <div>
-              {/* Search + filter */}
-              <div
-                className="fl-panel mb-5 p-4 fl-animate"
-                style={{ animationDelay: "270ms" }}
+          {pdfCount > 0 && (
+            <div
+              className="panel mb-4 px-4 py-3.5 an flex items-center gap-3"
+              style={{ animationDelay: "200ms" }}
+            >
+              <span className="text-2xl shrink-0">🤖</span>
+              <div className="flex-1 min-w-0">
+                <p
+                  className="ch text-xs font-bold"
+                  style={{ fontFamily: "var(--font-sora),sans-serif" }}
+                >
+                  PDF Chat ready
+                </p>
+                <p className="cm text-xs mt-0.5">
+                  Tap <span className="ca font-semibold">Chat with PDF</span> on
+                  any PDF to ask questions using Groq AI.
+                </p>
+              </div>
+              <span
+                className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
+                style={{
+                  background: "color-mix(in srgb,var(--ac) 14%,transparent)",
+                  color: "var(--ac)",
+                  border:
+                    "1px solid color-mix(in srgb,var(--ac) 35%,transparent)",
+                }}
               >
-                <div className="relative mb-3">
+                {pdfCount} PDF{pdfCount > 1 ? "s" : ""}
+              </span>
+            </div>
+          )}
+
+          <div
+            className="panel mb-4 p-3.5 sm:p-4 an"
+            style={{ animationDelay: "240ms" }}
+          >
+            <div className="relative mb-3">
+              <svg
+                className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 cm"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"
+                />
+              </svg>
+              <input
+                className="inp pl-9"
+                placeholder="Search files…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              {search && (
+                <button
+                  onClick={() => setSearch("")}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 cm"
+                  onMouseEnter={(e) =>
+                    (e.currentTarget.style.color = "var(--fh)")
+                  }
+                  onMouseLeave={(e) => (e.currentTarget.style.color = "")}
+                >
                   <svg
-                    className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 fl-muted"
+                    className="h-4 w-4"
                     fill="none"
                     stroke="currentColor"
-                    strokeWidth={1.5}
+                    strokeWidth={2}
                     viewBox="0 0 24 24"
                   >
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"
+                      d="M6 18L18 6M6 6l12 12"
                     />
                   </svg>
-                  <input
-                    className="fl-input pl-10"
-                    placeholder="Search files by name…"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                  />
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  <button
-                    onClick={() => setFilterCategory("ALL")}
-                    className={`fl-tab ${filterCategory === "ALL" ? "fl-tab-active" : ""}`}
-                  >
-                    All
-                  </button>
-                  {categories.map((c) => {
-                    const m = CATEGORY_META[c];
-                    const active = filterCategory === c;
-                    return (
-                      <button
-                        key={c}
-                        onClick={() => setFilterCategory(active ? "ALL" : c)}
-                        className="fl-tab"
-                        style={
-                          active
-                            ? {
-                                background: `${m.bg}`,
-                                borderColor: `${m.border}`,
-                                color: m.color,
-                              }
-                            : {}
-                        }
-                      >
-                        {m.emoji} {m.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Files */}
-              {loading ? (
-                <div className="space-y-3">
-                  {[1, 2, 3].map((i) => (
-                    <div
-                      key={i}
-                      className="fl-shimmer rounded-2xl"
-                      style={{ height: "80px" }}
-                    />
-                  ))}
-                </div>
-              ) : files.length === 0 ? (
-                <div
-                  className="fl-panel flex flex-col items-center justify-center py-16 text-center fl-animate"
-                  style={{ animationDelay: "310ms" }}
-                >
-                  <div className="fl-empty-bounce text-5xl mb-4">📁</div>
-                  <p
-                    className="fl-heading text-lg font-bold"
-                    style={{ fontFamily: "var(--font-sora), sans-serif" }}
-                  >
-                    {search ? "No files found" : "No files uploaded yet"}
-                  </p>
-                  <p className="fl-muted text-sm mt-1">
-                    {search
-                      ? "Try a different name"
-                      : "Upload your first file using the panel →"}
-                  </p>
-                </div>
-              ) : grouped ? (
-                <div className="space-y-6">
-                  {Object.entries(grouped).map(([cat, items]) => {
-                    const m = CATEGORY_META[cat as FileCategory];
-                    return (
-                      <div key={cat}>
-                        <div className="mb-3 flex items-center gap-3">
-                          <span className="text-sm">{m.emoji}</span>
-                          <span
-                            className="fl-subtext text-xs font-semibold"
-                            style={{
-                              fontFamily: "var(--font-sora), sans-serif",
-                            }}
-                          >
-                            {m.label}
-                          </span>
-                          <div className="h-px flex-1 fl-divider-line" />
-                          <span className="fl-muted text-xs">
-                            {items.length}
-                          </span>
-                        </div>
-                        <div className="space-y-3">
-                          {items.map((f, i) => (
-                            <div
-                              key={f.id}
-                              className="fl-animate"
-                              style={{ animationDelay: `${i * 30}ms` }}
-                            >
-                              <FileCard
-                                file={f}
-                                onDelete={handleDelete}
-                                onChat={setChatFile}
-                              />
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {files.map((f, i) => (
-                    <div
-                      key={f.id}
-                      className="fl-animate"
-                      style={{ animationDelay: `${i * 30}ms` }}
-                    >
-                      <FileCard
-                        file={f}
-                        onDelete={handleDelete}
-                        onChat={setChatFile}
-                      />
-                    </div>
-                  ))}
-                  <p className="fl-muted text-center text-xs pt-2">
-                    {files.length} file{files.length !== 1 ? "s" : ""}
-                  </p>
-                </div>
+                </button>
               )}
             </div>
-
-            {/* Right — upload + storage ring */}
-            <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-              <UploadZone onUpload={handleUpload} />
-
-              {/* Storage ring */}
-              {stats && (
-                <div
-                  className="fl-panel p-5 fl-animate"
-                  style={{ animationDelay: "400ms" }}
-                >
-                  <h3
-                    className="fl-heading text-sm font-bold mb-4"
-                    style={{ fontFamily: "var(--font-sora), sans-serif" }}
+            <div className="tab-row">
+              <button
+                onClick={() => setFilter("ALL")}
+                className={`tab ${filter === "ALL" ? "tab-on" : ""}`}
+              >
+                All
+              </button>
+              {categories.map((c) => {
+                const m = CAT[c];
+                const on = filter === c;
+                return (
+                  <button
+                    key={c}
+                    onClick={() => setFilter(on ? "ALL" : c)}
+                    className="tab"
+                    style={
+                      on
+                        ? {
+                            background: m.bg,
+                            borderColor: m.border,
+                            color: m.color,
+                          }
+                        : {}
+                    }
                   >
-                    Storage Overview
-                  </h3>
-                  <StorageRing
-                    used={stats.totalSizeBytes ?? 0}
-                    total={500 * 1024 * 1024}
-                  />
-                </div>
-              )}
-
-              {/* PDF chat hint */}
-              {pdfCount > 0 && (
-                <div
-                  className="fl-panel p-4 fl-animate"
-                  style={{ animationDelay: "450ms" }}
-                >
-                  <div className="flex items-start gap-3">
-                    <span className="text-2xl">🤖</span>
-                    <div>
-                      <p
-                        className="fl-heading text-sm font-bold"
-                        style={{ fontFamily: "var(--font-sora), sans-serif" }}
-                      >
-                        PDF Chat
-                      </p>
-                      <p className="fl-muted text-xs mt-0.5">
-                        You have {pdfCount} PDF{pdfCount !== 1 ? "s" : ""}.
-                        Hover any PDF and click{" "}
-                        <span style={{ color: "var(--fl-accent)" }}>Chat</span>{" "}
-                        to ask questions powered by Groq AI.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
+                    {m.emoji} {m.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
+
+          {loading ? (
+            <div className="space-y-3">
+              {[1, 2, 3].map((i) => (
+                <div
+                  key={i}
+                  className="shim rounded-2xl"
+                  style={{ height: "90px" }}
+                />
+              ))}
+            </div>
+          ) : files.length === 0 ? (
+            <div className="panel flex flex-col items-center justify-center py-14 text-center">
+              <div className="bonce text-5xl mb-4">📁</div>
+              <p
+                className="ch text-base font-bold"
+                style={{ fontFamily: "var(--font-sora),sans-serif" }}
+              >
+                {search ? "No files found" : "No files yet"}
+              </p>
+              <p className="cm text-sm mt-1">
+                {search
+                  ? "Try a different term"
+                  : "Tap the ＋ button to upload your first file"}
+              </p>
+            </div>
+          ) : grouped ? (
+            <div className="space-y-5">
+              {Object.entries(grouped).map(([cat, items]) => {
+                const m = CAT[cat as FileCategory] ?? CAT.OTHER;
+                return (
+                  <div key={cat}>
+                    <div className="flex items-center gap-2.5 mb-2.5">
+                      <span className="text-sm">{m.emoji}</span>
+                      <span
+                        className="cs text-xs font-semibold"
+                        style={{ fontFamily: "var(--font-sora),sans-serif" }}
+                      >
+                        {m.label}
+                      </span>
+                      <div className="h-px flex-1 dvl" />
+                      <span className="cm text-xs">{items.length}</span>
+                    </div>
+                    <div className="space-y-2.5">
+                      {items.map((f, i) => (
+                        <div
+                          key={f.id}
+                          className="an"
+                          style={{ animationDelay: `${i * 28}ms` }}
+                        >
+                          <FileCard
+                            file={f}
+                            onDelete={handleDelete}
+                            onChat={setChatFile}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {files.map((f, i) => (
+                <div
+                  key={f.id}
+                  className="an"
+                  style={{ animationDelay: `${i * 28}ms` }}
+                >
+                  <FileCard
+                    file={f}
+                    onDelete={handleDelete}
+                    onChat={setChatFile}
+                  />
+                </div>
+              ))}
+              <p className="cm text-center text-xs pt-2">
+                {files.length} file{files.length !== 1 ? "s" : ""}
+              </p>
+            </div>
+          )}
+
+          {stats && (
+            <div
+              className="panel mt-5 p-4 an"
+              style={{ animationDelay: "420ms" }}
+            >
+              <h3
+                className="ch text-sm font-bold mb-3.5"
+                style={{ fontFamily: "var(--font-sora),sans-serif" }}
+              >
+                Storage Overview
+              </h3>
+              <StorageRing
+                used={stats.totalSizeBytes ?? 0}
+                total={500 * 1024 * 1024}
+              />
+              {stats.filesByCategory &&
+                Object.keys(stats.filesByCategory).length > 0 && (
+                  <div
+                    className="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-2 border-t pt-3.5"
+                    style={{ borderColor: "var(--dv)" }}
+                  >
+                    {Object.entries(stats.filesByCategory).map(
+                      ([cat, count]) => {
+                        const m = CAT[cat as FileCategory] ?? CAT.OTHER;
+                        return (
+                          <div key={cat} className="flex items-center gap-2">
+                            <span className="text-sm">{m.emoji}</span>
+                            <span className="cm text-xs flex-1">{m.label}</span>
+                            <span
+                              className="text-xs font-bold tabular-nums"
+                              style={{
+                                color: m.color,
+                                fontFamily: "var(--font-sora),sans-serif",
+                              }}
+                            >
+                              {count}
+                            </span>
+                          </div>
+                        );
+                      },
+                    )}
+                  </div>
+                )}
+            </div>
+          )}
         </div>
 
-        {chatFile && (
-          <PdfChatPanel file={chatFile} onClose={() => setChatFile(null)} />
+        <button
+          onClick={() => setShowUpload(true)}
+          className="fab sm:hidden"
+          aria-label="Upload file"
+        >
+          <svg
+            className="h-6 w-6"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2.5}
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 4.5v15m7.5-7.5h-15"
+            />
+          </svg>
+        </button>
+
+        {showUpload && (
+          <UploadSheet
+            onUpload={handleUpload}
+            onClose={() => setShowUpload(false)}
+          />
         )}
 
-        {toastMsg && (
-          <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 fl-animate">
-            <div className="fl-toast flex items-center gap-2">{toastMsg}</div>
+        {chatFile && (
+          <PdfChat file={chatFile} onClose={() => setChatFile(null)} />
+        )}
+
+        {toast && (
+          <div className="fixed bottom-24 sm:bottom-6 left-1/2 -translate-x-1/2 z-50 an">
+            <div className="toast flex items-center gap-2 whitespace-nowrap">
+              {toast}
+            </div>
           </div>
         )}
       </div>
